@@ -1,0 +1,1372 @@
+ROADMAP DỰ ÁN: HIGH-CONCURRENCY BOOKING SYSTEM (Flash Sale)
+________________________________________
+📋 TỔNG QUAN DỰ ÁN
+Mục tiêu: Xây dựng hệ thống đặt vé/flash sale có khả năng xử lý hàng nghìn concurrent requests, đảm bảo không overselling, chịu tải cao.
+Tech Stack:
+•	Java 17+, Spring Boot 3.x
+•	PostgreSQL (main database)
+•	Redis (distributed lock, cache, delayed queue, rate limiting)
+•	RabbitMQ (message queue)
+•	Docker & Docker Compose
+•	Maven
+Thời gian ước tính: 6-8 tuần (làm part-time)
+________________________________________
+🗺️ ROADMAP CHI TIẾT
+________________________________________
+PHASE 0: CHUẨN BỊ & THIẾT KẾ (Tuần 1)
+0.1 Thiết kế hệ thống (System Design)
+Vẽ architecture diagram với các thành phần:
+Client → API Gateway (Spring Boot)
+              ↓
+        Rate Limiter (Redis Token Bucket)
+              ↓
+        Idempotency Check (Redis)
+              ↓
+        Redis Cache (inventory check)
+              ↓
+        RabbitMQ (order queue)
+              ↓
+        Order Consumer Service
+              ↓
+        PostgreSQL (persistent storage)
+              ↑
+        Redis Delayed Queue (auto-cancel after 15 min)
+              ↑
+        Reconciliation Job (sync Redis ↔ DB)
+Luồng xử lý chính (Happy Path):
+1.	User gửi request đặt vé kèm Idempotency-Key header
+2.	Rate Limiter kiểm tra user có vượt giới hạn gọi API không
+3.	Kiểm tra Idempotency Key trong Redis — nếu đã tồn tại thì trả về response cũ
+4.	Kiểm tra inventory trong Redis (nhanh, không hit DB)
+5.	Trừ inventory bằng Lua script (atomic operation, chống race condition)
+6.	Lưu Idempotency Key + response vào Redis (TTL 24h)
+7.	Đẩy message vào RabbitMQ queue
+8.	Trả về response ngay cho user (non-blocking)
+9.	Consumer xử lý: tạo order trong PostgreSQL
+10.	Đẩy task cancel vào Delayed Queue (TTL 15 phút)
+11.	Nếu user thanh toán → mark PAID, remove delayed task
+12.	Nếu hết 15 phút chưa thanh toán → consumer nhả vé lại
+13.	Reconciliation Job chạy định kỳ sync inventory Redis ↔ PostgreSQL
+________________________________________
+0.2 Thiết kế Database Schema
+sql
+-- Bảng events/products (sản phẩm flash sale)
+CREATE TABLE events (
+    id BIGSERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    total_quantity INTEGER NOT NULL,
+    available_quantity INTEGER NOT NULL,
+    price DECIMAL(10,2) NOT NULL,
+    sale_start_time TIMESTAMP NOT NULL,
+    sale_end_time TIMESTAMP NOT NULL,
+    status VARCHAR(50) DEFAULT 'ACTIVE', -- ACTIVE, ENDED, CANCELLED
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Bảng users
+CREATE TABLE users (
+    id BIGSERIAL PRIMARY KEY,
+    username VARCHAR(100) UNIQUE NOT NULL,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Bảng orders
+CREATE TABLE orders (
+    id BIGSERIAL PRIMARY KEY,
+    order_code VARCHAR(50) UNIQUE NOT NULL, -- UUID
+    user_id BIGINT REFERENCES users(id),
+    event_id BIGINT REFERENCES events(id),
+    quantity INTEGER NOT NULL DEFAULT 1,
+    unit_price DECIMAL(10,2) NOT NULL,
+    total_amount DECIMAL(10,2) NOT NULL,
+    status VARCHAR(50) DEFAULT 'PENDING', -- PENDING, PAID, CANCELLED, EXPIRED
+    expires_at TIMESTAMP NOT NULL,
+    paid_at TIMESTAMP,
+    cancelled_at TIMESTAMP,
+    cancel_reason VARCHAR(255),
+    idempotency_key VARCHAR(255), -- lưu để trace
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Bảng order_events (audit trail - optional nhưng nên có)
+CREATE TABLE order_events (
+    id BIGSERIAL PRIMARY KEY,
+    order_code VARCHAR(50) NOT NULL,
+    event_type VARCHAR(50) NOT NULL, -- CREATED, PAID, CANCELLED, EXPIRED
+    payload JSONB,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Index quan trọng
+CREATE INDEX idx_orders_user_id ON orders(user_id);
+CREATE INDEX idx_orders_event_id ON orders(event_id);
+CREATE INDEX idx_orders_status ON orders(status);
+CREATE INDEX idx_orders_expires_at ON orders(expires_at);
+CREATE INDEX idx_events_sale_time ON events(sale_start_time, sale_end_time);
+CREATE INDEX idx_order_events_order_code ON order_events(order_code);
+```
+
+---
+
+#### 0.3 Cấu trúc Project
+```
+flash-sale-system/
+├── docker-compose.yml
+├── pom.xml
+└── src/
+    └── main/
+        ├── java/com/flashsale/
+        │   ├── FlashSaleApplication.java
+        │   ├── config/
+        │   │   ├── RedisConfig.java
+        │   │   ├── RabbitMQConfig.java
+        │   │   └── SecurityConfig.java
+        │   ├── controller/
+        │   │   ├── BookingController.java
+        │   │   ├── EventController.java
+        │   │   ├── OrderController.java
+        │   │   └── AuthController.java
+        │   ├── service/
+        │   │   ├── BookingService.java
+        │   │   ├── InventoryService.java
+        │   │   ├── OrderService.java
+        │   │   ├── EventService.java
+        │   │   ├── PaymentService.java
+        │   │   ├── IdempotencyService.java     ← MỚI
+        │   │   └── ReconciliationService.java  ← MỚI
+        │   ├── consumer/
+        │   │   ├── OrderConsumer.java
+        │   │   └── DelayedOrderConsumer.java
+        │   ├── filter/
+        │   │   └── RateLimitFilter.java        ← MỚI
+        │   ├── repository/
+        │   │   ├── EventRepository.java
+        │   │   ├── OrderRepository.java
+        │   │   └── UserRepository.java
+        │   ├── entity/
+        │   │   ├── Event.java
+        │   │   ├── Order.java
+        │   │   ├── OrderEvent.java             ← MỚI
+        │   │   └── User.java
+        │   ├── dto/
+        │   │   ├── request/
+        │   │   └── response/
+        │   ├── exception/
+        │   │   ├── GlobalExceptionHandler.java
+        │   │   ├── InsufficientInventoryException.java
+        │   │   ├── DuplicateBookingException.java
+        │   │   ├── OrderNotFoundException.java
+        │   │   ├── OrderExpiredException.java
+        │   │   └── RateLimitExceededException.java ← MỚI
+        │   └── util/
+        │       ├── RedisKeyUtil.java
+        │       └── LuaScriptUtil.java
+        └── resources/
+            ├── application.yml
+            ├── application-dev.yml
+            └── scripts/
+                ├── inventory_deduct.lua
+                └── rate_limit.lua              ← MỚI
+________________________________________
+PHASE 1: SETUP MÔI TRƯỜNG (Tuần 1)
+1.1 Docker Compose Setup
+Thêm healthcheck cho tất cả services — tránh Spring Boot start trước khi Postgres/Redis/RabbitMQ sẵn sàng.
+yaml
+# docker-compose.yml
+version: '3.8'
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: flashsale
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d flashsale"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    ports:
+      - "5672:5672"
+      - "15672:15672" # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin123
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/flashsale
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_RABBITMQ_HOST: rabbitmq
+      JWT_SECRET: ${JWT_SECRET}   # ← đọc từ .env, không hardcode
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # Grafana + Prometheus (monitoring)
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+________________________________________
+1.2 Dependencies (pom.xml)
+xml
+<dependencies>
+    <!-- Spring Boot Starters -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-jpa</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-redis</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-amqp</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-security</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+
+    <!-- Database -->
+    <dependency>
+        <groupId>org.postgresql</groupId>
+        <artifactId>postgresql</artifactId>
+    </dependency>
+
+    <!-- JWT -->
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-api</artifactId>
+        <version>0.12.3</version>
+    </dependency>
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-impl</artifactId>
+        <version>0.12.3</version>
+    </dependency>
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-jackson</artifactId>
+        <version>0.12.3</version>
+    </dependency>
+
+    <!-- Redisson (distributed lock + rate limiting) -->
+    <dependency>
+        <groupId>org.redisson</groupId>
+        <artifactId>redisson-spring-boot-starter</artifactId>
+        <version>3.24.3</version>
+    </dependency>
+
+    <!-- Micrometer Prometheus -->
+    <dependency>
+        <groupId>io.micrometer</groupId>
+        <artifactId>micrometer-registry-prometheus</artifactId>
+    </dependency>
+
+    <!-- Lombok -->
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <optional>true</optional>
+    </dependency>
+
+    <!-- Testing -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-test</artifactId>
+        <scope>test</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>postgresql</artifactId>
+        <scope>test</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>rabbitmq</artifactId>
+        <scope>test</scope>
+    </dependency>
+</dependencies>
+________________________________________
+PHASE 2: CORE FEATURES (Tuần 2-3)
+2.1 Inventory Management với Redis
+Mục tiêu: Đảm bảo không bao giờ bán lố dù có bao nhiêu concurrent requests.
+Lua Script — Atomic Deduct Inventory:
+lua
+-- scripts/inventory_deduct.lua
+-- KEYS[1] = inventory key (vd: "inventory:event:1")
+-- KEYS[2] = user booking set key (vd: "booked:event:1")
+-- ARGV[1] = quantity cần trừ
+-- ARGV[2] = user_id
+
+local inventory = tonumber(redis.call('GET', KEYS[1]))
+
+if inventory == nil then
+    return -1  -- Event không tồn tại hoặc chưa load
+end
+
+if inventory <= 0 then
+    return -2  -- Hết hàng
+end
+
+-- Check user đã book chưa (chống book nhiều lần)
+local alreadyBooked = redis.call('SISMEMBER', KEYS[2], ARGV[2])
+if alreadyBooked == 1 then
+    return -3  -- User đã đặt rồi
+end
+
+-- Trừ inventory và ghi nhận user đã book (atomic)
+redis.call('DECRBY', KEYS[1], ARGV[1])
+redis.call('SADD', KEYS[2], ARGV[2])
+return 1  -- Thành công
+InventoryService.java:
+java
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class InventoryService {
+
+    private final StringRedisTemplate redisTemplate;
+    private final EventRepository eventRepository;
+
+    private static final String INVENTORY_KEY = "inventory:event:";
+    private static final String BOOKED_USERS_KEY = "booked:event:";
+
+    // Load inventory từ DB vào Redis khi flash sale bắt đầu
+    public void loadInventoryToCache(Long eventId) {
+        Event event = eventRepository.findById(eventId)
+            .orElseThrow(() -> new RuntimeException("Event not found"));
+        String key = INVENTORY_KEY + eventId;
+        redisTemplate.opsForValue().set(key,
+            String.valueOf(event.getAvailableQuantity()),
+            Duration.ofHours(24));
+        log.info("Loaded inventory for event {}: {} tickets", eventId, event.getAvailableQuantity());
+    }
+
+    // Atomic deduct bằng Lua script
+    public DeductResult deductInventory(Long eventId, Long userId, int quantity) {
+        DefaultRedisScript<Long> script = new DefaultRedisScript<>();
+        script.setScriptSource(new ResourceScriptSource(
+            new ClassPathResource("scripts/inventory_deduct.lua")));
+        script.setResultType(Long.class);
+
+        List<String> keys = Arrays.asList(
+            INVENTORY_KEY + eventId,
+            BOOKED_USERS_KEY + eventId
+        );
+
+        Long result = redisTemplate.execute(script, keys,
+            String.valueOf(quantity),
+            String.valueOf(userId));
+
+        return switch (result.intValue()) {
+            case  1 -> DeductResult.SUCCESS;
+            case -1 -> DeductResult.EVENT_NOT_FOUND;
+            case -2 -> DeductResult.SOLD_OUT;
+            case -3 -> DeductResult.ALREADY_BOOKED;
+            default -> DeductResult.UNKNOWN_ERROR;
+        };
+    }
+
+    // Rollback khi order bị cancel/expire
+    public void rollbackInventory(Long eventId, Long userId, int quantity) {
+        String inventoryKey = INVENTORY_KEY + eventId;
+        String bookedKey = BOOKED_USERS_KEY + eventId;
+        redisTemplate.opsForValue().increment(inventoryKey, quantity);
+        redisTemplate.opsForSet().remove(bookedKey, String.valueOf(userId));
+        log.info("Rolled back {} tickets for event {}, user {}", quantity, eventId, userId);
+    }
+
+    public int getCurrentInventory(Long eventId) {
+        String val = redisTemplate.opsForValue().get(INVENTORY_KEY + eventId);
+        return val == null ? 0 : Integer.parseInt(val);
+    }
+}
+________________________________________
+2.2 Idempotency Service ← MỚI
+Mục tiêu: Chống trường hợp client timeout rồi retry, tạo ra 2 order cho cùng 1 request.
+java
+@Service
+@RequiredArgsConstructor
+public class IdempotencyService {
+
+    private final StringRedisTemplate redisTemplate;
+    private static final String IDEMPOTENCY_KEY_PREFIX = "idempotency:";
+    private static final Duration TTL = Duration.ofHours(24);
+
+    // Kiểm tra key đã tồn tại chưa, nếu chưa thì set (atomic)
+    public boolean trySetKey(String key, String placeholder) {
+        Boolean isNew = redisTemplate.opsForValue()
+            .setIfAbsent(IDEMPOTENCY_KEY_PREFIX + key, placeholder, TTL);
+        return Boolean.TRUE.equals(isNew);
+    }
+
+    // Lưu response thực tế sau khi xử lý xong
+    public void saveResponse(String key, String responseJson) {
+        redisTemplate.opsForValue()
+            .set(IDEMPOTENCY_KEY_PREFIX + key, responseJson, TTL);
+    }
+
+    // Lấy response cũ nếu key đã tồn tại
+    public Optional<String> getExistingResponse(String key) {
+        String val = redisTemplate.opsForValue().get(IDEMPOTENCY_KEY_PREFIX + key);
+        return Optional.ofNullable(val);
+    }
+}
+Cách dùng trong BookingController:
+java
+@PostMapping("/events/{eventId}")
+public ResponseEntity<ApiResponse<BookingResponse>> book(
+        @PathVariable Long eventId,
+        @RequestBody @Valid BookingRequest request,
+        @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
+        @AuthenticationPrincipal UserDetails userDetails) {
+
+    Long userId = ((CustomUserDetails) userDetails).getId();
+
+    // Nếu có idempotency key, check cache trước
+    if (idempotencyKey != null) {
+        Optional<String> existing = idempotencyService.getExistingResponse(idempotencyKey);
+        if (existing.isPresent() && !existing.get().equals("PROCESSING")) {
+            BookingResponse cached = objectMapper.readValue(existing.get(), BookingResponse.class);
+            return ResponseEntity.accepted().body(ApiResponse.success(cached));
+        }
+        // Đánh dấu đang xử lý
+        idempotencyService.trySetKey(idempotencyKey, "PROCESSING");
+    }
+
+    BookingResponse response = bookingService.book(eventId, userId, request);
+
+    // Lưu response vào cache
+    if (idempotencyKey != null) {
+        idempotencyService.saveResponse(idempotencyKey, objectMapper.writeValueAsString(response));
+    }
+
+    return ResponseEntity.accepted().body(ApiResponse.success(response));
+}
+________________________________________
+2.3 Rate Limiting với Redis Lua Script ← MỚI
+Mục tiêu: Giới hạn mỗi user chỉ được gọi booking API tối đa N lần/phút, chặn bot/attacker.
+Lua Script — Token Bucket:
+lua
+-- scripts/rate_limit.lua
+-- KEYS[1] = rate limit key (vd: "rate:user:123:booking")
+-- ARGV[1] = max requests
+-- ARGV[2] = window seconds
+
+local current = redis.call('INCR', KEYS[1])
+if current == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+if current > tonumber(ARGV[1]) then
+    return 0  -- Bị chặn
+end
+return 1  -- Cho qua
+RateLimitFilter.java:
+java
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class RateLimitFilter extends OncePerRequestFilter {
+
+    private final StringRedisTemplate redisTemplate;
+
+    private static final int MAX_REQUESTS = 10;   // tối đa 10 lần
+    private static final int WINDOW_SECONDS = 60; // trong 60 giây
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain chain)
+            throws ServletException, IOException {
+
+        // Chỉ apply cho booking API
+        if (!request.getRequestURI().contains("/bookings/events/")) {
+            chain.doFilter(request, response);
+            return;
+        }
+
+        String userId = extractUserIdFromToken(request);
+        if (userId == null) {
+            chain.doFilter(request, response);
+            return;
+        }
+
+        String key = "rate:user:" + userId + ":booking";
+        DefaultRedisScript<Long> script = new DefaultRedisScript<>();
+        script.setScriptSource(new ResourceScriptSource(
+            new ClassPathResource("scripts/rate_limit.lua")));
+        script.setResultType(Long.class);
+
+        Long result = redisTemplate.execute(script,
+            List.of(key),
+            String.valueOf(MAX_REQUESTS),
+            String.valueOf(WINDOW_SECONDS));
+
+        if (result == null || result == 0) {
+            response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
+            response.setContentType("application/json");
+            response.getWriter().write(
+                "{\"success\":false,\"message\":\"Quá nhiều yêu cầu, vui lòng thử lại sau.\"}");
+            return;
+        }
+
+        chain.doFilter(request, response);
+    }
+
+    private String extractUserIdFromToken(HttpServletRequest request) {
+        // Parse JWT từ Authorization header
+        // ...
+        return null; // implement theo JWT logic của bạn
+    }
+}
+________________________________________
+2.4 RabbitMQ Configuration & Order Queue
+java
+@Configuration
+public class RabbitMQConfig {
+
+    public static final String ORDER_QUEUE       = "order.processing.queue";
+    public static final String ORDER_EXCHANGE    = "order.exchange";
+    public static final String ORDER_ROUTING_KEY = "order.create";
+
+    public static final String DELAY_QUEUE       = "order.delay.queue";
+    public static final String DELAY_EXCHANGE    = "order.delay.exchange";
+    public static final String DLQ_EXCHANGE      = "order.dlq.exchange";
+    public static final String DELAY_ROUTING_KEY = "order.delay";
+
+    @Bean public DirectExchange orderExchange() { return new DirectExchange(ORDER_EXCHANGE); }
+
+    @Bean
+    public Queue orderQueue() { return QueueBuilder.durable(ORDER_QUEUE).build(); }
+
+    @Bean
+    public Binding orderBinding() {
+        return BindingBuilder.bind(orderQueue()).to(orderExchange()).with(ORDER_ROUTING_KEY);
+    }
+
+    @Bean public DirectExchange delayExchange() { return new DirectExchange(DELAY_EXCHANGE); }
+    @Bean public DirectExchange dlqExchange()   { return new DirectExchange(DLQ_EXCHANGE); }
+
+    @Bean
+    public Queue delayQueue() {
+        return QueueBuilder.durable(DELAY_QUEUE)
+            .withArgument("x-dead-letter-exchange", DLQ_EXCHANGE)
+            .withArgument("x-dead-letter-routing-key", "order.cancel")
+            .withArgument("x-message-ttl", 900000) // 15 phút
+            .build();
+    }
+
+    @Bean
+    public Queue dlqQueue() { return QueueBuilder.durable("order.cancel.queue").build(); }
+
+    @Bean
+    public Binding dlqBinding() {
+        return BindingBuilder.bind(dlqQueue()).to(dlqExchange()).with("order.cancel");
+    }
+
+    @Bean
+    public MessageConverter jsonMessageConverter() { return new Jackson2JsonMessageConverter(); }
+
+    @Bean
+    public RabbitTemplate rabbitTemplate(ConnectionFactory cf) {
+        RabbitTemplate template = new RabbitTemplate(cf);
+        template.setMessageConverter(jsonMessageConverter());
+        return template;
+    }
+}
+________________________________________
+2.5 Booking Service — Luồng chính
+java
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class BookingService {
+
+    private final InventoryService inventoryService;
+    private final RabbitTemplate rabbitTemplate;
+    private final BookingMetrics bookingMetrics;
+
+    @Transactional
+    public BookingResponse book(Long eventId, Long userId, BookingRequest request) {
+
+        // Bước 1: Atomic check & deduct inventory trong Redis
+        DeductResult result = inventoryService.deductInventory(
+            eventId, userId, request.getQuantity());
+
+        if (result != DeductResult.SUCCESS) {
+            bookingMetrics.recordBookingFailed(eventId, result.name());
+            throw switch (result) {
+                case SOLD_OUT        -> new InsufficientInventoryException("Hết vé!");
+                case ALREADY_BOOKED  -> new DuplicateBookingException("Bạn đã đặt vé này rồi!");
+                default              -> new RuntimeException("Lỗi hệ thống");
+            };
+        }
+
+        // Bước 2: Tạo order message và đẩy vào RabbitMQ
+        String orderCode = UUID.randomUUID().toString();
+        OrderMessage orderMessage = OrderMessage.builder()
+            .orderCode(orderCode)
+            .eventId(eventId)
+            .userId(userId)
+            .quantity(request.getQuantity())
+            .timestamp(Instant.now())
+            .build();
+
+        try {
+            rabbitTemplate.convertAndSend(
+                RabbitMQConfig.ORDER_EXCHANGE,
+                RabbitMQConfig.ORDER_ROUTING_KEY,
+                orderMessage);
+        } catch (Exception e) {
+            // Nếu enqueue thất bại → rollback inventory
+            log.error("Failed to enqueue order, rolling back inventory", e);
+            inventoryService.rollbackInventory(eventId, userId, request.getQuantity());
+            throw new RuntimeException("Không thể xử lý đặt vé, vui lòng thử lại");
+        }
+
+        bookingMetrics.recordBookingSuccess(eventId);
+
+        // Bước 3: Trả về response ngay (không chờ DB write)
+        return BookingResponse.builder()
+            .orderCode(orderCode)
+            .status("PROCESSING")
+            .message("Đặt vé thành công! Vui lòng thanh toán trong 15 phút.")
+            .expiresAt(LocalDateTime.now().plusMinutes(15))
+            .build();
+    }
+}
+________________________________________
+2.6 Order Consumer — Xử lý bất đồng bộ
+java
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class OrderConsumer {
+
+    private final OrderRepository orderRepository;
+    private final EventRepository eventRepository;
+    private final RabbitTemplate rabbitTemplate;
+
+    @RabbitListener(queues = RabbitMQConfig.ORDER_QUEUE)
+    public void processOrder(OrderMessage message) {
+        log.info("Processing order: {}", message.getOrderCode());
+        try {
+            Event event = eventRepository.findById(message.getEventId())
+                .orElseThrow(() -> new RuntimeException("Event not found"));
+
+            Order order = Order.builder()
+                .orderCode(message.getOrderCode())
+                .userId(message.getUserId())
+                .event(event)
+                .quantity(message.getQuantity())
+                .unitPrice(event.getPrice())
+                .totalAmount(event.getPrice().multiply(BigDecimal.valueOf(message.getQuantity())))
+                .status(OrderStatus.PENDING)
+                .expiresAt(LocalDateTime.now().plusMinutes(15))
+                .build();
+
+            orderRepository.save(order);
+
+            // Đẩy vào Delayed Queue để auto-cancel sau 15 phút
+            CancelMessage cancelMessage = new CancelMessage(
+                message.getOrderCode(), message.getEventId(),
+                message.getUserId(), message.getQuantity());
+
+            rabbitTemplate.convertAndSend(
+                RabbitMQConfig.DELAY_EXCHANGE,
+                RabbitMQConfig.DELAY_ROUTING_KEY,
+                cancelMessage);
+
+            log.info("Order {} saved to DB, cancel scheduled", message.getOrderCode());
+
+        } catch (Exception e) {
+            log.error("Failed to process order {}: {}", message.getOrderCode(), e.getMessage());
+            throw new AmqpRejectAndDontRequeueException("Order processing failed", e);
+        }
+    }
+}
+________________________________________
+2.7 Auto-Cancel Consumer (Delayed Queue)
+java
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class DelayedOrderConsumer {
+
+    private final OrderRepository orderRepository;
+    private final InventoryService inventoryService;
+
+    @RabbitListener(queues = "order.cancel.queue")
+    public void processCancelOrder(CancelMessage message) {
+        log.info("Auto-cancel check for order: {}", message.getOrderCode());
+
+        orderRepository.findByOrderCode(message.getOrderCode())
+            .ifPresent(order -> {
+                if (order.getStatus() == OrderStatus.PENDING) {
+                    order.setStatus(OrderStatus.EXPIRED);
+                    order.setCancelledAt(LocalDateTime.now());
+                    order.setCancelReason("Hết thời gian thanh toán (15 phút)");
+                    orderRepository.save(order);
+
+                    // Nhả vé lại vào kho
+                    inventoryService.rollbackInventory(
+                        message.getEventId(),
+                        message.getUserId(),
+                        message.getQuantity());
+
+                    log.info("Order {} expired and rolled back", message.getOrderCode());
+                } else {
+                    // QUAN TRỌNG: Nếu đã PAID thì không làm gì cả
+                    log.info("Order {} already processed (status: {}), skip cancel",
+                        message.getOrderCode(), order.getStatus());
+                }
+            });
+    }
+}
+________________________________________
+2.8 Reconciliation Service ← MỚI
+Mục tiêu: Phòng trường hợp app crash giữa chừng làm lệch dữ liệu giữa Redis và PostgreSQL.
+java
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class ReconciliationService {
+
+    private final EventRepository eventRepository;
+    private final OrderRepository orderRepository;
+    private final InventoryService inventoryService;
+
+    // Chạy mỗi 5 phút
+    @Scheduled(fixedDelay = 300_000)
+    public void reconcileInventory() {
+        log.info("Starting inventory reconciliation...");
+
+        List<Event> activeEvents = eventRepository.findByStatus("ACTIVE");
+
+        for (Event event : activeEvents) {
+            int redisInventory = inventoryService.getCurrentInventory(event.getId());
+
+            // Tính inventory thực tế từ DB
+            int pendingOrPaidCount = orderRepository
+                .countByEventIdAndStatusIn(event.getId(),
+                    List.of(OrderStatus.PENDING, OrderStatus.PAID));
+            int dbInventory = event.getTotalQuantity() - pendingOrPaidCount;
+
+            if (redisInventory != dbInventory) {
+                log.warn("Inventory mismatch for event {}: Redis={}, DB={}. Fixing...",
+                    event.getId(), redisInventory, dbInventory);
+
+                // Lấy DB làm source of truth
+                inventoryService.forceSetInventory(event.getId(), dbInventory);
+            }
+        }
+
+        log.info("Reconciliation completed.");
+    }
+}
+```
+
+---
+
+### PHASE 3: DISTRIBUTED LOCK — PAYMENT (Tuần 3)
+
+#### 3.1 Vai trò của Distributed Lock
+
+Lua script đã xử lý concurrent inventory deduct hoàn toàn. Distributed Lock ở tầng này **không** bảo vệ inventory mà bảo vệ **idempotency của thanh toán** — tránh double payment khi user bấm nút Pay nhiều lần cùng lúc:
+```
+User bấm Pay → acquire lock(orderId) → process payment → release lock
+User bấm Pay lần 2 (double click) → try acquire lock → FAILED → "đang xử lý"
+3.2 Payment Service với Redisson Lock
+java
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class PaymentService {
+
+    private final RedissonClient redissonClient;
+    private final OrderRepository orderRepository;
+
+    private static final String PAYMENT_LOCK_PREFIX = "lock:payment:order:";
+    private static final int LOCK_WAIT_TIME  = 3;  // giây
+    private static final int LOCK_LEASE_TIME = 10; // giây
+
+    public PaymentResponse processPayment(String orderCode, Long userId, PaymentRequest request) {
+        String lockKey = PAYMENT_LOCK_PREFIX + orderCode;
+        RLock lock = redissonClient.getLock(lockKey);
+
+        try {
+            boolean acquired = lock.tryLock(LOCK_WAIT_TIME, LOCK_LEASE_TIME, TimeUnit.SECONDS);
+            if (!acquired) {
+                return PaymentResponse.failed("Đơn hàng đang được xử lý, vui lòng chờ.");
+            }
+            return executePayment(orderCode, userId, request);
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Payment interrupted");
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+
+    @Transactional
+    private PaymentResponse executePayment(String orderCode, Long userId, PaymentRequest request) {
+        Order order = orderRepository.findByOrderCode(orderCode)
+            .orElseThrow(() -> new OrderNotFoundException("Order not found: " + orderCode));
+
+        if (!order.getUserId().equals(userId))
+            throw new UnauthorizedException("Không có quyền thanh toán đơn này");
+
+        if (order.getStatus() != OrderStatus.PENDING)
+            throw new InvalidOrderStatusException("Đơn hàng không thể thanh toán. Trạng thái: " + order.getStatus());
+
+        if (LocalDateTime.now().isAfter(order.getExpiresAt()))
+            throw new OrderExpiredException("Đơn hàng đã hết hạn thanh toán");
+
+        boolean paymentSuccess = mockPaymentGateway(request);
+        if (paymentSuccess) {
+            order.setStatus(OrderStatus.PAID);
+            order.setPaidAt(LocalDateTime.now());
+            orderRepository.save(order);
+            return PaymentResponse.success("Thanh toán thành công!", order.getTotalAmount());
+        } else {
+            return PaymentResponse.failed("Thanh toán thất bại, vui lòng thử lại.");
+        }
+    }
+
+    private boolean mockPaymentGateway(PaymentRequest request) {
+        // Mock: luôn thành công — thực tế gọi VNPay/Stripe/etc.
+        return true;
+    }
+}
+________________________________________
+PHASE 4: API CONTROLLERS & SECURITY (Tuần 4)
+4.1 BookingController (đầy đủ)
+java
+@RestController
+@RequestMapping("/api/v1/bookings")
+@RequiredArgsConstructor
+public class BookingController {
+
+    private final BookingService bookingService;
+    private final OrderService orderService;
+    private final PaymentService paymentService;
+    private final IdempotencyService idempotencyService;
+    private final ObjectMapper objectMapper;
+
+    // POST /api/v1/bookings/events/{eventId}
+    @PostMapping("/events/{eventId}")
+    public ResponseEntity<ApiResponse<BookingResponse>> book(
+            @PathVariable Long eventId,
+            @RequestBody @Valid BookingRequest request,
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
+            @AuthenticationPrincipal UserDetails userDetails) throws JsonProcessingException {
+
+        Long userId = ((CustomUserDetails) userDetails).getId();
+
+        if (idempotencyKey != null) {
+            Optional<String> existing = idempotencyService.getExistingResponse(idempotencyKey);
+            if (existing.isPresent() && !existing.get().equals("PROCESSING")) {
+                BookingResponse cached = objectMapper.readValue(existing.get(), BookingResponse.class);
+                return ResponseEntity.accepted().body(ApiResponse.success(cached));
+            }
+            idempotencyService.trySetKey(idempotencyKey, "PROCESSING");
+        }
+
+        BookingResponse response = bookingService.book(eventId, userId, request);
+
+        if (idempotencyKey != null) {
+            idempotencyService.saveResponse(idempotencyKey, objectMapper.writeValueAsString(response));
+        }
+
+        return ResponseEntity.accepted().body(ApiResponse.success(response));
+    }
+
+    // POST /api/v1/bookings/orders/{orderCode}/pay
+    @PostMapping("/orders/{orderCode}/pay")
+    public ResponseEntity<ApiResponse<PaymentResponse>> pay(
+            @PathVariable String orderCode,
+            @RequestBody @Valid PaymentRequest request,
+            @AuthenticationPrincipal UserDetails userDetails) {
+
+        Long userId = ((CustomUserDetails) userDetails).getId();
+        PaymentResponse response = paymentService.processPayment(orderCode, userId, request);
+        return ResponseEntity.ok(ApiResponse.success(response));
+    }
+
+    // GET /api/v1/bookings/orders/{orderCode}
+    @GetMapping("/orders/{orderCode}")
+    public ResponseEntity<ApiResponse<OrderResponse>> getOrder(
+            @PathVariable String orderCode,
+            @AuthenticationPrincipal UserDetails userDetails) {
+
+        Long userId = ((CustomUserDetails) userDetails).getId();
+        OrderResponse response = orderService.getOrder(orderCode, userId);
+        return ResponseEntity.ok(ApiResponse.success(response));
+    }
+
+    // GET /api/v1/bookings/orders/my
+    @GetMapping("/orders/my")
+    public ResponseEntity<ApiResponse<Page<OrderResponse>>> getMyOrders(
+            @AuthenticationPrincipal UserDetails userDetails,
+            Pageable pageable) {
+
+        Long userId = ((CustomUserDetails) userDetails).getId();
+        Page<OrderResponse> orders = orderService.getOrdersByUser(userId, pageable);
+        return ResponseEntity.ok(ApiResponse.success(orders));
+    }
+}
+________________________________________
+4.2 Chuẩn hóa API Response
+java
+@Data
+@Builder
+public class ApiResponse<T> {
+    private boolean success;
+    private String message;
+    private T data;
+    private LocalDateTime timestamp;
+
+    public static <T> ApiResponse<T> success(T data) {
+        return ApiResponse.<T>builder()
+            .success(true).data(data).timestamp(LocalDateTime.now()).build();
+    }
+
+    public static <T> ApiResponse<T> error(String message) {
+        return ApiResponse.<T>builder()
+            .success(false).message(message).timestamp(LocalDateTime.now()).build();
+    }
+}
+________________________________________
+4.3 Global Exception Handler
+java
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(InsufficientInventoryException.class)
+    public ResponseEntity<ApiResponse<Void>> handleSoldOut(InsufficientInventoryException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiResponse.error(e.getMessage()));
+    }
+
+    @ExceptionHandler(DuplicateBookingException.class)
+    public ResponseEntity<ApiResponse<Void>> handleDuplicate(DuplicateBookingException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiResponse.error(e.getMessage()));
+    }
+
+    @ExceptionHandler(OrderExpiredException.class)
+    public ResponseEntity<ApiResponse<Void>> handleExpired(OrderExpiredException e) {
+        return ResponseEntity.status(HttpStatus.GONE).body(ApiResponse.error(e.getMessage()));
+    }
+
+    @ExceptionHandler(RateLimitExceededException.class)
+    public ResponseEntity<ApiResponse<Void>> handleRateLimit(RateLimitExceededException e) {
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(ApiResponse.error(e.getMessage()));
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<ApiResponse<Map<String, String>>> handleValidation(MethodArgumentNotValidException e) {
+        Map<String, String> errors = new HashMap<>();
+        e.getBindingResult().getFieldErrors()
+            .forEach(err -> errors.put(err.getField(), err.getDefaultMessage()));
+        return ResponseEntity.badRequest()
+            .body(ApiResponse.<Map<String, String>>builder().success(false).data(errors).build());
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiResponse<Void>> handleGeneral(Exception e) {
+        log.error("Unhandled exception", e);
+        return ResponseEntity.internalServerError().body(ApiResponse.error("Lỗi hệ thống, vui lòng thử lại"));
+    }
+}
+________________________________________
+PHASE 5: TESTING & PERFORMANCE (Tuần 5-6)
+5.1 Unit Tests
+java
+@ExtendWith(MockitoExtension.class)
+class InventoryServiceTest {
+
+    @Mock StringRedisTemplate redisTemplate;
+    @InjectMocks InventoryService inventoryService;
+
+    @Test
+    void deductInventory_whenSoldOut_shouldReturnSoldOutResult() { ... }
+
+    @Test
+    void deductInventory_whenAlreadyBooked_shouldReturnDuplicateResult() { ... }
+
+    @Test
+    void rollbackInventory_shouldIncrementRedisCorrectly() { ... }
+}
+
+@ExtendWith(MockitoExtension.class)
+class BookingServiceTest {
+
+    @Test
+    void book_whenInventoryDeductFails_shouldThrowException() { ... }
+
+    @Test
+    void book_whenQueueFails_shouldRollbackInventory() { ... }
+}
+
+// ← MỚI
+@ExtendWith(MockitoExtension.class)
+class DelayedOrderConsumerTest {
+
+    @Test
+    void processCancelOrder_whenPending_shouldExpireAndRollback() { ... }
+
+    @Test
+    void processCancelOrder_whenAlreadyPaid_shouldSkip() { ... }
+}
+
+// ← MỚI
+@ExtendWith(MockitoExtension.class)
+class ReconciliationServiceTest {
+
+    @Test
+    void reconcile_whenRedisMismatchDB_shouldFixRedis() { ... }
+
+    @Test
+    void reconcile_whenDataConsistent_shouldDoNothing() { ... }
+}
+________________________________________
+5.2 Integration Tests
+java
+@SpringBootTest
+@Testcontainers
+class BookingIntegrationTest {
+
+    @Container
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:15");
+
+    @Container
+    static GenericContainer<?> redis = new GenericContainer<>("redis:7-alpine")
+        .withExposedPorts(6379);
+
+    @Test
+    void concurrentBooking_shouldNotOversell() throws InterruptedException {
+        int totalTickets = 100;
+        int totalUsers   = 500;
+
+        ExecutorService executor = Executors.newFixedThreadPool(50);
+        CountDownLatch latch = new CountDownLatch(totalUsers);
+        AtomicInteger successCount = new AtomicInteger(0);
+        AtomicInteger failCount    = new AtomicInteger(0);
+
+        for (int i = 0; i < totalUsers; i++) {
+            final int userId = i;
+            executor.submit(() -> {
+                try {
+                    bookingService.book(eventId, (long) userId, request);
+                    successCount.incrementAndGet();
+                } catch (InsufficientInventoryException e) {
+                    failCount.incrementAndGet();
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        latch.await(30, TimeUnit.SECONDS);
+
+        assertEquals(totalTickets, successCount.get());
+        assertEquals(totalUsers - totalTickets, failCount.get());
+        assertEquals(0, inventoryService.getCurrentInventory(eventId));
+    }
+
+    // ← MỚI
+    @Test
+    void sameIdempotencyKey_shouldReturnSameResponse() {
+        String idempotencyKey = UUID.randomUUID().toString();
+        BookingResponse first  = bookingService.book(eventId, userId, request); // lần 1
+        BookingResponse second = bookingService.book(eventId, userId, request); // lần 2 (retry)
+        assertEquals(first.getOrderCode(), second.getOrderCode());
+    }
+}
+________________________________________
+5.3 Load Testing với k6
+javascript
+// k6 load test script
+import http from 'k6/http';
+import { check } from 'k6';
+
+export let options = {
+    vus: 500,        // 500 virtual users
+    duration: '30s',
+};
+
+export default function() {
+    let response = http.post(
+        'http://localhost:8080/api/v1/bookings/events/1',
+        JSON.stringify({ quantity: 1 }),
+        { headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${__ENV.TOKEN}`,
+            'Idempotency-Key': `${__VU}-${__ITER}` // ← MỖI request có key riêng
+        }}
+    );
+
+    check(response, {
+        'status is 202 or 409': (r) => r.status === 202 || r.status === 409,
+        'status is not 429':    (r) => r.status !== 429,  // không bị rate limit bất ngờ
+        'response time < 500ms':(r) => r.timings.duration < 500,
+    });
+}
+Metrics cần đạt:
+•	✅ 0% overselling
+•	✅ Response time < 200ms (P95)
+•	✅ Throughput > 1000 RPS
+•	✅ 0 duplicate orders
+•	✅ 0 data inconsistency sau reconciliation
+________________________________________
+PHASE 6: MONITORING & OBSERVABILITY (Tuần 6-7)
+6.1 application.yml — Actuator + Prometheus
+yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+6.2 Custom Metrics
+java
+@Component
+@RequiredArgsConstructor
+public class BookingMetrics {
+
+    private final MeterRegistry meterRegistry;
+
+    public void recordBookingSuccess(Long eventId) {
+        meterRegistry.counter("booking.success", "eventId", eventId.toString()).increment();
+    }
+
+    public void recordBookingFailed(Long eventId, String reason) {
+        meterRegistry.counter("booking.failed",
+            "eventId", eventId.toString(),
+            "reason", reason).increment();
+    }
+
+    public void recordInventoryLevel(Long eventId, int level) {
+        meterRegistry.gauge("inventory.level",
+            Tags.of("eventId", eventId.toString()), level);
+    }
+
+    // ← MỚI
+    public void recordRateLimitHit(String userId) {
+        meterRegistry.counter("rate.limit.hit", "userId", userId).increment();
+    }
+
+    // ← MỚI
+    public void recordReconciliationMismatch(Long eventId) {
+        meterRegistry.counter("reconciliation.mismatch", "eventId", eventId.toString()).increment();
+    }
+}
+6.3 Structured Logging
+java
+log.info("Booking processed: eventId={}, userId={}, orderCode={}, result={}, latency={}ms",
+    eventId, userId, orderCode, result, latency);
+6.4 Grafana Dashboard ← MỚI
+Thêm vào docker-compose.yml (đã có ở Phase 1). Tạo file grafana/dashboards/booking.json với các panel:
+•	Booking success/fail rate theo thời gian
+•	Inventory level theo event
+•	Rate limit hit count
+•	P95 latency
+•	RabbitMQ queue depth
+________________________________________
+PHASE 7: HOÀN THIỆN & DEPLOY (Tuần 7-8)
+7.1 Dockerfile (Multi-stage)
+dockerfile
+FROM eclipse-temurin:17-jdk-alpine AS builder
+WORKDIR /app
+COPY pom.xml .
+COPY src ./src
+RUN ./mvnw package -DskipTests
+
+FROM eclipse-temurin:17-jre-alpine
+WORKDIR /app
+COPY --from=builder /app/target/*.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
+7.2 application.yml đầy đủ
+yaml
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/flashsale
+    username: admin
+    password: admin123
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 3000ms
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: admin
+    password: admin123
+    listener:
+      simple:
+        retry:
+          enabled: true
+          initial-interval: 1000
+          max-attempts: 3
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+
+jwt:
+  secret: ${JWT_SECRET}   # ← KHÔNG hardcode, đọc từ env
+  expiration: 86400000    # 24 giờ
+
+booking:
+  payment-timeout-minutes: 15
+  max-quantity-per-user: 2
+  rate-limit:
+    max-requests: 10
+    window-seconds: 60
+```
+
+#### 7.3 .env file (gitignore cái này)
+```
+JWT_SECRET=your-very-long-random-secret-key-here
+POSTGRES_PASSWORD=admin123
+RABBITMQ_DEFAULT_PASS=admin123
+7.4 README.md
+Viết README đầy đủ bao gồm:
+•	Architecture diagram
+•	How to run locally (cp .env.example .env → docker-compose up)
+•	API Documentation (curl examples có kèm Idempotency-Key header)
+•	Design decisions & trade-offs (tại sao dùng Lua thay vì pessimistic lock, tại sao DLX thay vì scheduler, v.v.)
+•	Performance test results
+________________________________________
+📊 CHECKLIST HOÀN THÀNH
+Core Features
+•	Inventory load vào Redis khi flash sale bắt đầu
+•	Lua script atomic deduct inventory
+•	Chống duplicate booking cùng user
+•	Rate Limiting — giới hạn số lần gọi API/phút ← MỚI
+•	Idempotency Key — chống retry tạo đơn trùng ← MỚI
+•	RabbitMQ nhận và xử lý order async
+•	Order được lưu vào PostgreSQL bởi consumer
+•	Distributed lock khi thanh toán (Redisson)
+•	Auto-cancel sau 15 phút (DLX pattern)
+•	Rollback inventory khi cancel/expire
+•	Reconciliation Job sync Redis ↔ DB ← MỚI
+API
+•	POST /auth/register, /auth/login
+•	GET /events, GET /events/{id}
+•	POST /bookings/events/{eventId} (có Idempotency-Key support)
+•	POST /bookings/orders/{code}/pay
+•	GET /bookings/orders/my
+•	GET /bookings/orders/{code}
+Quality
+•	Unit tests cho Service layer (bao gồm DelayedOrderConsumer, ReconciliationService) ← MỚI
+•	Integration test: concurrent booking không oversell
+•	Integration test: idempotency key không tạo đơn trùng ← MỚI
+•	Load test với k6/JMeter
+•	Global exception handler (bao gồm RateLimitExceededException) ← MỚI
+•	Input validation
+•	Structured logging
+•	Docker Compose với healthcheck ← MỚI
+•	JWT secret từ environment variable ← MỚI
+•	Grafana dashboard cơ bản ← MỚI
+________________________________________
+🎯 ĐIỂM NHẤN KHI TRÌNH BÀY TRÊN CV
+"Xây dựng hệ thống flash sale xử lý 1000+ concurrent requests/giây, đảm bảo 0% overselling thông qua:"
+•	Redis Lua scripts để atomic check-and-deduct inventory — loại bỏ race condition hoàn toàn
+•	Idempotency Key pattern ngăn tạo đơn trùng khi client retry sau timeout
+•	Rate Limiting bằng Redis Token Bucket — chống bot hammer API
+•	RabbitMQ để decouple booking request khỏi DB write — response time < 100ms dù tải cao
+•	Dead Letter Queue pattern để tự động hủy đơn chưa thanh toán sau 15 phút, giải phóng inventory
+•	Redisson distributed lock ngăn double payment tại tầng thanh toán
+•	Reconciliation Job định kỳ đồng bộ Redis ↔ PostgreSQL, đảm bảo data consistency khi có sự cố
+•	Load test đạt 1200 RPS, P95 latency 180ms, 0 oversold trong 10,000 concurrent requests
+________________________________________
+💡 GỢI Ý MỞ RỘNG (Bonus nếu có thời gian)
+1.	WebSocket Notification — Thông báo real-time khi thanh toán thành công/đơn hết hạn
+2.	Event Sourcing — Log tất cả state change của order vào order_events để audit trail (schema đã có sẵn)
+3.	Admin Dashboard API — Endpoint xem inventory real-time, số đơn pending, revenue
+4.	Circuit Breaker — Dùng Resilience4j bảo vệ khi RabbitMQ/Redis tạm thời down
+5.	Outbox Pattern — Thay vì gọi RabbitMQ trực tiếp trong transaction, ghi vào bảng outbox trước để đảm bảo at-least-once delivery
+________________________________________
+Đây là phiên bản hoàn chỉnh. Những chỗ có dấu ← MỚI là những điểm đã được bổ sung so với bản gốc của bạn. Phần còn lại giữ nguyên logic, chỉ làm sạch format và bổ sung chú thích chỗ cần thiết.
+
